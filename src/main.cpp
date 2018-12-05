@@ -9,9 +9,40 @@
 
 #include "lodepng.h" //Used for png encoding.
 
-const int WIDTH = 3200; // Size of rendered mandelbrot set.
-const int HEIGHT = 2400; // Size of renderered mandelbrot set.
+// convolution parameters
+const int WIDTH = 400;
+const int HEIGHT = 400;
+const int IN_CHANNEL = 64;
+int OUT_CHANNEL = 256;
+const int FILTER_H = 3;
+const int FILTER_W = 3;
+const int PAD_H = 1;
+const int PAD_W = 1;
+const int STRIDE_H = 1;
+const int STRIDE_W = 1;
+#define M (HEIGHT * WIDTH)
+#define N (OUT_CHANNEL)
+#define K (IN_CHANNEL * FILTER_H * FILTER_W)
+#define BUFFER_NUM 3 // input, weights and output
+#define ITERATION 10
 const int WORKGROUP_SIZE = 32; // Workgroup size in compute shader.
+
+struct ShaderParam {
+    int in_h;
+    int in_w;
+    int out_h;
+    int out_w;
+    int stride_h;
+    int stride_w;
+    int pad_h;
+    int pad_w;
+    int filter_h;
+    int filter_w;
+    int channels;
+    int m;
+    int k;
+    int n;
+};
 
 #ifdef NDEBUG
 const bool enableValidationLayers = false;
@@ -26,6 +57,7 @@ const bool enableValidationLayers = true;
     if (res != VK_SUCCESS)																				\
     {																									\
         printf("Fatal : VkResult is %d in %s at line %d\n", res,  __FILE__, __LINE__); \
+        throw std::runtime_error("throw error: Vulkan failed\n"); \
         assert(res == VK_SUCCESS);																		\
     }																									\
 }
@@ -33,7 +65,7 @@ const bool enableValidationLayers = true;
 /*
 The application launches a compute shader that renders the mandelbrot set,
 by rendering it into a storage buffer.
-The storage buffer is then read from the GPU, and saved as .png. 
+The storage buffer is then read from the GPU, and saved as .png.
 */
 class ComputeApplication {
 private:
@@ -43,26 +75,26 @@ private:
     };
     
     /*
-    In order to use Vulkan, you must create an instance. 
+    In order to use Vulkan, you must create an instance.
     */
     VkInstance instance;
 
     VkDebugReportCallbackEXT debugReportCallback;
     /*
     The physical device is some device on the system that supports usage of Vulkan.
-    Often, it is simply a graphics card that supports Vulkan. 
+    Often, it is simply a graphics card that supports Vulkan.
     */
     VkPhysicalDevice physicalDevice;
     /*
-    Then we have the logical device VkDevice, which basically allows 
-    us to interact with the physical device. 
+    Then we have the logical device VkDevice, which basically allows
+    us to interact with the physical device.
     */
     VkDevice device;
 
     /*
     The pipeline specifies the pipeline that all graphics and compute commands pass though in Vulkan.
 
-    We will be creating a simple compute pipeline in this application. 
+    We will be creating a simple compute pipeline in this application.
     */
     VkPipeline pipeline;
     VkPipelineLayout pipelineLayout;
@@ -79,7 +111,7 @@ private:
     /*
 
     Descriptors represent resources in shaders. They allow us to use things like
-    uniform buffers, storage buffers and images in GLSL. 
+    uniform buffers, storage buffers and images in GLSL.
 
     A single descriptor represents a single resource, and several descriptors are organized
     into descriptor sets, which are basically just collections of descriptors.
@@ -91,12 +123,18 @@ private:
     /*
     The mandelbrot set will be rendered to this buffer.
 
-    The memory that backs the buffer is bufferMemory. 
+    The memory that backs the buffer is bufferMemory.
     */
-    VkBuffer buffer;
-    VkDeviceMemory bufferMemory;
+    VkBuffer bufferIn;
+    VkBuffer bufferOut;
+    VkBuffer bufferWeight;
+    VkDeviceMemory bufferMemoryIn;
+    VkDeviceMemory bufferMemoryOut;
+    VkDeviceMemory bufferMemoryWeight;
         
-    uint32_t bufferSize; // size of `buffer` in bytes.
+    uint32_t bufferSizeIn; // size of `input buffer` in bytes.
+    uint32_t bufferSizeOut;
+    uint32_t bufferSizeWeight;
 
     std::vector<const char *> enabledLayers;
 
@@ -123,29 +161,55 @@ private:
 public:
     void run() {
         // Buffer size of the storage buffer that will contain the rendered mandelbrot set.
-        bufferSize = sizeof(Pixel) * WIDTH * HEIGHT;
+        bufferSizeIn = sizeof(float) * WIDTH * HEIGHT * IN_CHANNEL;
+        if (getenv("LIGHT_WORKLOAD"))
+            OUT_CHANNEL = 64;
+        bufferSizeOut = sizeof(float) * WIDTH * HEIGHT * OUT_CHANNEL;
+        bufferSizeWeight = sizeof(float) * OUT_CHANNEL * IN_CHANNEL * FILTER_H * FILTER_W;
 
         // Initialize vulkan:
         createInstance();
         findPhysicalDevice();
         createDevice();
-        createBuffer();
-        createDescriptorSetLayout();
-        createDescriptorSet();
+        createBuffer(bufferIn, bufferMemoryIn, bufferSizeIn);
+        createBuffer(bufferOut, bufferMemoryOut, bufferSizeOut);
+        createBuffer(bufferWeight, bufferMemoryWeight, bufferSizeWeight);
+        createDescriptorSetLayout(BUFFER_NUM);
+        createDescriptorSet(BUFFER_NUM);
         createComputePipeline();
         createCommandBuffer();
 
-        // Finally, run the recorded command buffer.
-        runCommandBuffer();
+
+        for (int i = 0; i < ITERATION; i++)
+        {
+            printf("iteration %d\n", i);
+
+            bindBuffer(device, bufferIn, bufferSizeIn, 0, descriptorSet);
+            bindBuffer(device, bufferWeight, bufferSizeWeight, 1, descriptorSet);
+            bindBuffer(device, bufferOut, bufferSizeOut, 2, descriptorSet);
+
+            ShaderParam param = {HEIGHT, WIDTH,
+                HEIGHT, WIDTH,
+                STRIDE_H, STRIDE_H,
+                PAD_H, PAD_W,
+                FILTER_H, FILTER_W,
+                IN_CHANNEL,
+                HEIGHT * WIDTH, IN_CHANNEL * FILTER_H * FILTER_W, OUT_CHANNEL};
+
+            recordCommandBuffer((void *)&param, sizeof(ShaderParam));
+            // Finally, run the recorded command buffer.
+            runCommandBuffer();
+        }
 
         // The former command rendered a mandelbrot set to a buffer.
         // Save that buffer as a png on disk.
-        saveRenderedImage();
+        //saveRenderedImage();
 
         // Clean up all vulkan resources.
         cleanup();
     }
 
+    /*
     void saveRenderedImage() {
         void* mappedMemory = NULL;
         // Map the buffer memory, so that we can read from it on the CPU.
@@ -169,6 +233,7 @@ public:
         unsigned error = lodepng::encode("mandelbrot.png", image, WIDTH, HEIGHT);
         if (error) printf("encoder error %d: %s", error, lodepng_error_text(error));
     }
+    */
 
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugReportCallbackFn(
         VkDebugReportFlagsEXT                       flags,
@@ -439,7 +504,7 @@ public:
         return -1;
     }
 
-    void createBuffer() {
+    void createBuffer(VkBuffer &buffer, VkDeviceMemory &bufferMemory, uint32_t bufferSize) {
         /*
         We will now create a buffer. We will render the mandelbrot set into this buffer
         in a computer shade later. 
@@ -488,7 +553,7 @@ public:
         VK_CHECK_RESULT(vkBindBufferMemory(device, buffer, bufferMemory, 0));
     }
 
-    void createDescriptorSetLayout() {
+    void createDescriptorSetLayout(int buffer_num) {
         /*
         Here we specify a descriptor set layout. This allows us to bind our descriptors to 
         resources in the shader. 
@@ -503,22 +568,25 @@ public:
 
         in the compute shader.
         */
-        VkDescriptorSetLayoutBinding descriptorSetLayoutBinding = {};
-        descriptorSetLayoutBinding.binding = 0; // binding = 0
-        descriptorSetLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        descriptorSetLayoutBinding.descriptorCount = 1;
-        descriptorSetLayoutBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutBinding descriptorSetLayoutBinding[buffer_num] = {};
+        for (int i = 0; i < buffer_num; i++)
+        {
+            descriptorSetLayoutBinding[i].binding = i;
+            descriptorSetLayoutBinding[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            descriptorSetLayoutBinding[i].descriptorCount = 1;
+            descriptorSetLayoutBinding[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
 
         VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCreateInfo = {};
         descriptorSetLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        descriptorSetLayoutCreateInfo.bindingCount = 1; // only a single binding in this descriptor set layout. 
-        descriptorSetLayoutCreateInfo.pBindings = &descriptorSetLayoutBinding; 
+        descriptorSetLayoutCreateInfo.bindingCount = buffer_num;
+        descriptorSetLayoutCreateInfo.pBindings = descriptorSetLayoutBinding;
 
         // Create the descriptor set layout. 
         VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCreateInfo, NULL, &descriptorSetLayout));
     }
 
-    void createDescriptorSet() {
+    void createDescriptorSet(int buffer_num) {
         /*
         So we will allocate a descriptor set here.
         But we need to first create a descriptor pool to do that. 
@@ -529,7 +597,7 @@ public:
         */
         VkDescriptorPoolSize descriptorPoolSize = {};
         descriptorPoolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        descriptorPoolSize.descriptorCount = 1;
+        descriptorPoolSize.descriptorCount = buffer_num;
 
         VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {};
         descriptorPoolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -544,35 +612,31 @@ public:
         With the pool allocated, we can now allocate the descriptor set. 
         */
         VkDescriptorSetAllocateInfo descriptorSetAllocateInfo = {};
-        descriptorSetAllocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; 
+        descriptorSetAllocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         descriptorSetAllocateInfo.descriptorPool = descriptorPool; // pool to allocate from.
         descriptorSetAllocateInfo.descriptorSetCount = 1; // allocate a single descriptor set.
         descriptorSetAllocateInfo.pSetLayouts = &descriptorSetLayout;
 
         // allocate descriptor set.
         VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &descriptorSetAllocateInfo, &descriptorSet));
+    }
 
-        /*
-        Next, we need to connect our actual storage buffer with the descrptor. 
-        We use vkUpdateDescriptorSets() to update the descriptor set.
-        */
+    void bindBuffer(VkDevice& device, VkBuffer& buffer, uint32_t buf_size, int binding, VkDescriptorSet descriptor_set)
+    {
+        VkDescriptorBufferInfo desc_buffer_info = {};
+        desc_buffer_info.buffer = buffer;
+        desc_buffer_info.offset = 0;
+        desc_buffer_info.range = buf_size;
 
-        // Specify the buffer to bind to the descriptor.
-        VkDescriptorBufferInfo descriptorBufferInfo = {};
-        descriptorBufferInfo.buffer = buffer;
-        descriptorBufferInfo.offset = 0;
-        descriptorBufferInfo.range = bufferSize;
+        VkWriteDescriptorSet write_descriptor_set = {};
+        write_descriptor_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write_descriptor_set.dstSet = descriptor_set;
+        write_descriptor_set.dstBinding = binding;
+        write_descriptor_set.descriptorCount = 1;
+        write_descriptor_set.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write_descriptor_set.pBufferInfo = &desc_buffer_info;
 
-        VkWriteDescriptorSet writeDescriptorSet = {};
-        writeDescriptorSet.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writeDescriptorSet.dstSet = descriptorSet; // write to this descriptor set.
-        writeDescriptorSet.dstBinding = 0; // write to the first, and only binding.
-        writeDescriptorSet.descriptorCount = 1; // update a single descriptor.
-        writeDescriptorSet.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; // storage buffer.
-        writeDescriptorSet.pBufferInfo = &descriptorBufferInfo;
-
-        // perform the update of the descriptor set.
-        vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, NULL);
+        vkUpdateDescriptorSets(device, 1, &write_descriptor_set, 0, NULL);
     }
 
     // Read file into array of bytes, and cast to uint32_t*, then return.
@@ -642,10 +706,19 @@ public:
         The pipeline layout allows the pipeline to access descriptor sets. 
         So we just specify the descriptor set layout we created earlier.
         */
+
+        VkPushConstantRange push_constant_ranges[1] = {};
+        push_constant_ranges[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push_constant_ranges[0].offset = 0;
+        push_constant_ranges[0].size = sizeof(ShaderParam);
+
         VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo = {};
         pipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pipelineLayoutCreateInfo.setLayoutCount = 1;
-        pipelineLayoutCreateInfo.pSetLayouts = &descriptorSetLayout; 
+        pipelineLayoutCreateInfo.pSetLayouts = &descriptorSetLayout;
+        pipelineLayoutCreateInfo.pushConstantRangeCount = 1;
+        pipelineLayoutCreateInfo.pPushConstantRanges = push_constant_ranges;
+
         VK_CHECK_RESULT(vkCreatePipelineLayout(device, &pipelineLayoutCreateInfo, NULL, &pipelineLayout));
 
         VkComputePipelineCreateInfo pipelineCreateInfo = {};
@@ -670,7 +743,7 @@ public:
         */
         VkCommandPoolCreateInfo commandPoolCreateInfo = {};
         commandPoolCreateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        commandPoolCreateInfo.flags = 0;
+        commandPoolCreateInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         // the queue family of this command pool. All command buffers allocated from this command pool,
         // must be submitted to queues of this family ONLY. 
         commandPoolCreateInfo.queueFamilyIndex = queueFamilyIndex;
@@ -688,7 +761,9 @@ public:
         commandBufferAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         commandBufferAllocateInfo.commandBufferCount = 1; // allocate a single command buffer. 
         VK_CHECK_RESULT(vkAllocateCommandBuffers(device, &commandBufferAllocateInfo, &commandBuffer)); // allocate command buffer.
+    }
 
+    void recordCommandBuffer(void* push_constants, size_t push_constants_size) {
         /*
         Now we shall start recording commands into the newly allocated command buffer. 
         */
@@ -696,6 +771,11 @@ public:
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; // the buffer is only submitted and used once in this application.
         VK_CHECK_RESULT(vkBeginCommandBuffer(commandBuffer, &beginInfo)); // start recording commands.
+
+        if (push_constants)
+            vkCmdPushConstants(commandBuffer, pipelineLayout,
+                               VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               push_constants_size, push_constants);
 
         /*
         We need to bind a pipeline, AND a descriptor set before we dispatch.
@@ -710,7 +790,7 @@ public:
         The number of workgroups is specified in the arguments.
         If you are already familiar with compute shaders from OpenGL, this should be nothing new to you.
         */
-        vkCmdDispatch(commandBuffer, (uint32_t)ceil(WIDTH / float(WORKGROUP_SIZE)), (uint32_t)ceil(HEIGHT / float(WORKGROUP_SIZE)), 1);
+        vkCmdDispatch(commandBuffer, (uint32_t)ceil(M / float(WORKGROUP_SIZE)), (uint32_t)N, 1);
 
         VK_CHECK_RESULT(vkEndCommandBuffer(commandBuffer)); // end recording commands.
     }
@@ -764,8 +844,12 @@ public:
             func(instance, debugReportCallback, NULL);
         }
 
-        vkFreeMemory(device, bufferMemory, NULL);
-        vkDestroyBuffer(device, buffer, NULL);	
+        vkFreeMemory(device, bufferMemoryIn, NULL);
+        vkFreeMemory(device, bufferMemoryWeight, NULL);
+        vkFreeMemory(device, bufferMemoryOut, NULL);
+        vkDestroyBuffer(device, bufferIn, NULL);
+        vkDestroyBuffer(device, bufferWeight, NULL);
+        vkDestroyBuffer(device, bufferOut, NULL);
         vkDestroyShaderModule(device, computeShaderModule, NULL);
         vkDestroyDescriptorPool(device, descriptorPool, NULL);
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, NULL);
